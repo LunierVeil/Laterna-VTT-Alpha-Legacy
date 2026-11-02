@@ -11,6 +11,7 @@ import { randomUUID } from 'node:crypto';
 const web = resolve(import.meta.dirname, '../..'), root = resolve(web, '..');
 let browser, server, vite, dir, base, api, gm, player, sceneId, control;
 const errors = [];
+let serverLog = "", viteLog = "";
 async function port() {
   const s = createServer(); await new Promise(r => s.listen(0, '127.0.0.1', r));
   const n = s.address().port; await new Promise(r => s.close(r)); return n;
@@ -79,8 +80,9 @@ before(async () => {
   const key = randomUUID(); await writeFile(resolve(dir, 'key'), key, {mode: 0o600});
   server = spawn(resolve(root, 'server/.venv/bin/uvicorn'), ['app.main:app','--host','127.0.0.1','--port',String(apiPort),'--no-proxy-headers'], {
     cwd: resolve(root,'server'), env: {...process.env, DATABASE_URL:`sqlite+aiosqlite:///${dir}/test.db`, UPLOAD_DIR:resolve(dir,'uploads'), GM_KEY_FILE:resolve(dir,'key'), FRONTEND_URL:base}, stdio: ['ignore','pipe','pipe']});
-  let logs = ''; server.stderr.on('data', x => logs += x); server.stdout.resume();
-  vite = spawn(process.execPath, [resolve(web,'node_modules/vite/bin/vite.js'),'--host','127.0.0.1','--port',String(webPort),'--strictPort'], {cwd:web,env:{...process.env,VITE_API_TARGET:api},stdio:'ignore'});
+  server.stderr.on('data', x => serverLog += x); server.stdout.on('data', x => serverLog += x);
+  vite = spawn(process.execPath, [resolve(web,'node_modules/vite/bin/vite.js'),'--host','127.0.0.1','--port',String(webPort),'--strictPort'], {cwd:web,env:{...process.env,VITE_API_TARGET:api},stdio:['ignore','pipe','pipe']});
+  vite.stdout.on('data', x => viteLog += x); vite.stderr.on('data', x => viteLog += x);
   await ready(`${api}/api/health`); await ready(base);
   browser = await chromium.launch({headless:true, ...(process.env.CHROMIUM_PATH ? {executablePath:process.env.CHROMIUM_PATH} : {}), args:['--no-sandbox','--enable-blink-features=MiddleClickAutoscroll']});
   gm = await browser.newContext({viewport:{width:1280,height:900}});
@@ -99,6 +101,9 @@ before(async () => {
 after(async () => {
   await browser?.close();
   for(const p of [vite,server]) if(p && p.exitCode===null) {p.kill('SIGTERM'); await new Promise(r=>{p.once('exit',r);setTimeout(()=>{p.kill('SIGKILL');r();},3000).unref();});}
+  const out=process.env.BROWSER_RESULTS_DIR||resolve(tmpdir(),'laterna-browser-results');
+  await mkdir(out,{recursive:true});
+  await writeFile(resolve(out,'server.log'),serverLog); await writeFile(resolve(out,'vite.log'),viteLog);
   if(dir) await rm(dir,{recursive:true,force:true});
   assert.deepEqual(errors,[], 'browser page errors');
 });

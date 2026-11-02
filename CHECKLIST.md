@@ -841,3 +841,21 @@ B16 подтверждён полным прогоном после исправ
 | 26 | Final preview touch and secrecy: touch drag/cancel, GM-layer, fog destination, scene switch | PASS |
 
 Строка B01/B02 подтверждает только локальную автоматическую проверку; исходные сетевые баги через Porthole не закрыты. Для воспроизведения: из web выполнить `CHROMIUM_PATH=/usr/bin/chromium npm run test:browser`.
+
+
+## Подготовка репозитория и CI/CD перед Beta (02.11.2026)
+
+Исходное состояние: master `187b8191d64b852e7a497a43f6fe3f2f7913945e`, рабочее дерево было чистым. Повторные проверки текущего приложения: **169 backend / 33 frontend / 26 Chromium — PASS**, 0 failed/0 skipped; TypeScript, production build и исходный smoke-test — PASS. Backend дополнительно повторён в отдельном чистом venv после установки requirements: **169 PASS**. npm ci выполнен заново; в Cloud использован writable npm cache /workspace/.npm-cache. Предупреждения Starlette/httpx и Vite chunk size сохранены, проверки не ослаблялись.
+
+- [x] CI: Python 3.12, Node 24, независимые backend/frontend/browser jobs, один resolved SHA и обязательный `CI required`, caches, concurrency, минимальные permissions и artifacts.
+- [x] Release: candidate -> reusable CI -> Windows build -> extracted embedded-Python package smoke -> отдельный publish job; ручной запуск publish=false, никаких выпусков по обычному master push.
+- [x] Публикация только нового draft после загрузки/проверки assets; существующие релизы не редактируются. Официальные Actions закреплены по проверенным SHA с Node 24 runtime.
+- [x] Actionlint 1.7.7: оба workflow PASS; передаваемые inputs дополнительно сверены с action.yml закреплённых версий. Bash syntax PASS. Парсер PowerShell 7.4.10 на Linux: внешние и inline ps1-сценарии PASS. Это не реальное выполнение Windows-пакета.
+- [x] 11 unittest средств переноса/экспорта: рабочие правки, private paths/secret signature/symlink/no-overwrite, pagination, отказ API, размеры и digest release assets — PASS.
+- [x] Отдельные remote/local mirrors и bundles: remote 2 ветки, 3 тега, refs/pull/1/head; local дополнительно work. fsck, сравнение всех доступных refs и peeled commits, bundle verify и clone/readback v0.1.0-alpha — PASS. Старые авторы и коммиты не переписывались.
+- [x] .gitignore расширен; snapshot builder копирует working tree, а не только HEAD, сохраняет режимы/хеши, не копирует .git/данные/зависимости и не делает init/commit.
+- [ ] Реальные GitHub Actions jobs, branch protection/rulesets и release environment — после согласованного первого push. API здесь вернул Forbidden; изменения GitHub не выполнялись.
+- [ ] Реальный Windows ZIP, full package smoke, интерактивное меню и машина без Python — проверить ручным candidate run publish=false на Windows runner. Синтаксическая проверка не заменяет этот шаг.
+- [ ] Владелец должен отдельно экспортировать GitHub metadata/assets/настройки и реальные локальные DB/uploads/ключи, затем сохранить backup вне Cloud. Git mirror этого не покрывает.
+
+B01/B02/B14 остаются открытыми. История Alpha Legacy остаётся отдельно от будущего нового root commit. Архитектурные этапы не начаты. В этой подготовке commit/push/tag/rename/archive/release не выполняются. Полная процедура, rollback и bootstrap защиты master — docs/REPOSITORY_MIGRATION.md; CI/CD — docs/CI_CD.md. Артефакты подготовки/отчёт/манифесты хранятся вне активного репозитория в /workspace/Laterna-VTT-Beta-Preparation.

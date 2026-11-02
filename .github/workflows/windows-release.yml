@@ -1,113 +1,196 @@
-# Архив для Windows: встроенный Python со всеми пакетами и собранная
-# страница - мастеру ничего не ставить, распаковал и запустил laterna.bat.
-# По тегу v* архив прикладывается к релизу (pre-release); вручную
-# (workflow_dispatch) - только собирается и проверяется.
 name: Windows release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ['v*']
   workflow_dispatch:
+    inputs:
+      candidate_ref:
+        description: Commit or ref to check and package
+        type: string
+        default: master
+        required: true
+      publish:
+        description: Publish only after all checks (requires an existing matching tag)
+        type: boolean
+        default: false
+      release_tag:
+        description: Existing tag pointing exactly to the candidate (publication only)
+        type: string
+        required: false
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  windows:
-    runs-on: windows-latest
-    env:
-      # Встроенный Python - тот же минор, что и pip ниже (колёса cp312).
-      PY_EMBED: "3.12.10"
+  candidate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      publish: ${{ steps.resolve.outputs.publish }}
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          node-version: "20"
-
-      - name: Собрать страницу
-        working-directory: web
+          ref: ${{ inputs.candidate_ref || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - id: resolve
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REQUEST_PUBLISH: ${{ inputs.publish }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        shell: bash
         run: |
-          npm ci
-          npm run build
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          publish=false
+          tag=''
+          if [[ "$EVENT" = push && "$REF" = refs/tags/v* ]]; then
+            publish=true
+            tag=${REF#refs/tags/}
+          elif [[ "$REQUEST_PUBLISH" = true ]]; then
+            publish=true
+            tag=$RELEASE_TAG
+          fi
+          if [[ "$publish" = true ]]; then
+            [[ "$tag" =~ ^v[0-9][A-Za-z0-9._-]*$ ]] || { echo 'Invalid release tag'; exit 1; }
+            test "$(git rev-parse --verify "refs/tags/$tag^{commit}")" = "$sha"
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/setup-python@v5
+  checks:
+    needs: candidate
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.candidate.outputs.sha }}
+    permissions:
+      contents: read
+
+  windows:
+    needs: [candidate, checks]
+    runs-on: windows-latest
+    timeout-minutes: 30
+    outputs:
+      artifact: ${{ steps.package.outputs.artifact }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          python-version: "3.12"
-
-      - name: Собрать архив
-        shell: pwsh
-        run: |
-          $ref = "${{ github.ref_name }}" -replace '[^A-Za-z0-9._-]', '-'
-          $name = "Laterna-VTT-$ref-windows"
-          $out = "dist\$name"
-          New-Item -ItemType Directory -Force $out | Out-Null
-
-          # Встроенный Python с python.org. В ._pth - где искать модули:
-          # без "import site" и Lib\site-packages пакеты не найдутся.
-          Invoke-WebRequest "https://www.python.org/ftp/python/$env:PY_EMBED/python-$env:PY_EMBED-embed-amd64.zip" -OutFile python-embed.zip
-          Expand-Archive python-embed.zip "$out\python"
-          $pth = Get-ChildItem "$out\python\python*._pth" | Select-Object -First 1
-          $zip = $pth.BaseName + ".zip"
-          Set-Content $pth.FullName "$zip`r`n.`r`nLib\site-packages`r`nimport site" -Encoding ascii
-          python -m pip install --no-cache-dir --target "$out\python\Lib\site-packages" -r server\requirements.txt
-
-          New-Item -ItemType Directory -Force "$out\server", "$out\web", "$out\docs" | Out-Null
-          Copy-Item server\app "$out\server\app" -Recurse
-          Get-ChildItem "$out\server\app" -Recurse -Directory -Filter __pycache__ | Remove-Item -Recurse -Force
-          Copy-Item web\dist "$out\web\dist" -Recurse
-          Copy-Item windows\laterna.bat, windows\laterna.ps1 $out
-          Copy-Item docs\FIRST_SESSION.md "$out\docs\"
-          Copy-Item LICENSE, README.md $out
-
-          Compress-Archive "$out\*" "dist\$name.zip"
-          "NAME=$name" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-
-      - name: Проверить архив на Windows
-        shell: pwsh
-        run: |
-          # Запускаем ровно то, что получит мастер: распакованный архив.
-          Expand-Archive "dist\$env:NAME.zip" smoke
-          $env:LANTERNA_GM_KEY = "ci-smoke-key-0123456789"
-          $env:LANTERNA_TRUST_PROXY = "0"
-          $env:PYTHONUTF8 = "1"
-          $server = (Resolve-Path smoke\server).Path
-          $p = Start-Process -FilePath smoke\python\python.exe -PassThru -NoNewWindow `
-            -WorkingDirectory $server `
-            -ArgumentList "-m", "uvicorn", "app.main:app", "--app-dir", $server, "--host", "127.0.0.1", "--port", "8000", "--no-proxy-headers"
-          try {
-            $ok = $false
-            for ($i = 0; $i -lt 60; $i++) {
-              try { $r = Invoke-WebRequest http://127.0.0.1:8000/api/health -UseBasicParsing; if ($r.StatusCode -eq 200) { $ok = $true; break } } catch {}
-              Start-Sleep -Seconds 1
-            }
-            if (-not $ok) { throw "сервер из архива не поднялся" }
-            $page = Invoke-WebRequest http://127.0.0.1:8000/ -UseBasicParsing
-            if ($page.Content -notmatch "Laterna") { throw "страница не отдаётся" }
-            $login = Invoke-WebRequest http://127.0.0.1:8000/api/gm/login -Method Post -ContentType "application/json" `
-              -Body '{"key":"ci-smoke-key-0123456789"}' -UseBasicParsing
-            if ($login.Content -notmatch "needs_setup") { throw "вход мастера по ключу не работает" }
-            Write-Host "архив работает: сервер, страница, вход по ключу"
-          } finally {
-            Stop-Process -Id $p.Id -Force
-          }
-
-      - uses: actions/upload-artifact@v4
+          ref: ${{ needs.checks.outputs.tested_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          name: ${{ env.NAME }}
-          path: dist/${{ env.NAME }}.zip
-
-      - name: Приложить к релизу
-        if: startsWith(github.ref, 'refs/tags/')
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: server/requirements.txt
+      - name: Verify exact tested commit
         shell: pwsh
         env:
-          GH_TOKEN: ${{ github.token }}
+          TESTED_SHA: ${{ needs.checks.outputs.tested_sha }}
+          CANDIDATE_SHA: ${{ needs.candidate.outputs.sha }}
         run: |
-          $tag = "${{ github.ref_name }}"
-          gh release view $tag 2>$null
-          if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --prerelease --title "Laterna VTT $tag" --notes-file docs\RELEASE_ALPHA.md
-          } else {
-            gh release edit $tag --prerelease --title "Laterna VTT $tag" --notes-file docs\RELEASE_ALPHA.md
-          }
-          gh release upload $tag "dist\$env:NAME.zip" --clobber
+          if ($env:TESTED_SHA -ne $env:CANDIDATE_SHA) { throw 'CI candidate mismatch' }
+          if ((git rev-parse HEAD) -ne $env:TESTED_SHA) { throw 'Checkout mismatch' }
+      - name: Build frontend
+        working-directory: web
+        shell: pwsh
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'npm ci failed' }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'frontend build failed' }
+      - name: Build portable Windows ZIP
+        id: package
+        shell: pwsh
+        env:
+          TESTED_SHA: ${{ needs.checks.outputs.tested_sha }}
+        run: |
+          $name = "Laterna-VTT-$($env:TESTED_SHA.Substring(0,12))-windows"
+          ./scripts/build-windows.ps1 -Name $name -SourceCommit $env:TESTED_SHA
+          "artifact=$name" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+      - name: Start extracted embedded Python and run repository smoke-test
+        shell: pwsh
+        env:
+          PACKAGE_NAME: ${{ steps.package.outputs.artifact }}
+        run: ./scripts/test-windows-package.ps1 -ZipPath "dist/$env:PACKAGE_NAME.zip"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ${{ steps.package.outputs.artifact }}
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: failure()
+        with:
+          name: windows-smoke-diagnostics
+          path: artifacts/windows-smoke/
+
+  publish:
+    needs: [candidate, checks, windows]
+    if: needs.candidate.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Configure required reviewers for this environment after the initial push.
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.checks.outputs.tested_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: ${{ needs.windows.outputs.artifact }}
+          path: release-files
+      - name: Verify and publish a new release (never edit an existing release)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.candidate.outputs.tag }}
+          TESTED_SHA: ${{ needs.checks.outputs.tested_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$TESTED_SHA"
+          test "$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")" = "$TESTED_SHA"
+          remote=$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}")
+          remote_sha=$(printf '%s\n' "$remote" | awk '$2 ~ /\^\{\}$/ {print $1}')
+          if [[ -z "$remote_sha" ]]; then remote_sha=$(printf '%s\n' "$remote" | awk 'NR==1 {print $1}'); fi
+          test "$remote_sha" = "$TESTED_SHA"
+          (cd release-files && sha256sum -c ./*.sha256)
+          # Fetch the release list successfully before deciding that a tag is new.
+          # A network/auth failure must not be mistaken for "release not found".
+          tags=$(gh release list --limit 1000 --json tagName --jq '.[].tagName')
+          if printf '%s\n' "$tags" | grep -Fxq "$RELEASE_TAG"; then
+            echo 'Release already exists; refusing to overwrite it'; exit 1
+          fi
+          gh release create "$RELEASE_TAG" --draft --verify-tag --prerelease \
+            --title "Laterna VTT $RELEASE_TAG" --notes-file docs/RELEASE_ALPHA.md
+          gh release upload "$RELEASE_TAG" release-files/*.zip release-files/*.sha256
+          # Upload failures leave only an unpublished draft.
+          gh release view "$RELEASE_TAG" --json isDraft,assets > release-state.json
+          python - <<'PYCODE'
+          import json
+          from pathlib import Path
+          state = json.loads(Path('release-state.json').read_text())
+          assert state['isDraft']
+          expected = {p.name: p.stat().st_size for p in Path('release-files').iterdir()}
+          assert {a['name']: a['size'] for a in state['assets']} == expected
+          PYCODE
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease
